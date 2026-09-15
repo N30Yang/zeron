@@ -274,7 +274,13 @@ impl OpencodeHarness {
         let mut server = self.server(None).await?;
         let result = async {
             let providers: ProviderCatalog = server.get("/provider", None).await?;
-            let models = models_from_providers(&providers);
+            let mut models = models_from_providers(&providers);
+            // Persona agents ride the picker as `agent/<name>` rows; the run
+            // path sends them as the prompt's `agent` (the agent's own pinned
+            // model applies). Best-effort: older servers may lack `/agent`.
+            if let Ok(agents) = server.get_json("/agent", None).await {
+                models.extend(agents_from_wire(&agents));
+            }
             if models.is_empty() {
                 return Err(HarnessError::Protocol(
                     "opencode advertised no models (`opencode auth login` to configure a provider)"
@@ -774,6 +780,35 @@ fn commands_from_wire(commands: &Value) -> Vec<SlashCommand> {
         .unwrap_or_default()
 }
 
+/// `GET /agent` → picker rows: `agent/<name>` ids backed by the opencode
+/// agent's own pinned model (the run path sends `agent`, no `model`).
+/// Sorted for a stable picker.
+fn agents_from_wire(agents: &Value) -> Vec<Model> {
+    let mut out: Vec<Model> = agents
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|a| {
+                    let name = a.get("name").and_then(Value::as_str)?;
+                    Some(Model {
+                        id: format!("agent/{name}"),
+                        label: name.to_owned(),
+                        description: a
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .filter(|d| !d.is_empty())
+                            .map(|d| format!("opencode agent — {d}")),
+                        reasoning_levels: Vec::new(),
+                        options: Vec::new(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
@@ -971,10 +1006,19 @@ async fn run_session(session: Session) {
         }
     };
 
+    // `agent/<name>` picker rows address an opencode agent, not a model:
+    // the prompt carries `agent` and no `model`, so the agent's own pinned
+    // model applies.
+    let agent = request.model.as_deref().and_then(|m| {
+        m.split_once('/')
+            .filter(|(provider, _)| *provider == "agent")
+            .map(|(_, name)| name.to_owned())
+    });
     let model = request
         .model
         .as_deref()
         .and_then(|m| m.split_once('/'))
+        .filter(|(provider, _)| *provider != "agent")
         .map(|(provider, model)| (provider.to_owned(), model.to_owned()));
     let variant = model.as_ref().and_then(|(provider, model_id)| {
         pick_variant(&providers, provider, model_id, request.reasoning)
@@ -1069,6 +1113,7 @@ async fn run_session(session: Session) {
         &model,
         variant.as_deref(),
         &request.attachments,
+        agent.as_deref(),
     );
     if let Err(e) = post_prompt(
         &server,
@@ -1154,7 +1199,7 @@ async fn run_session(session: Session) {
                 }).await {
                     break $label;
                 }
-                let body = prompt_body(&steer, &model, variant.as_deref(), &[]);
+                let body = prompt_body(&steer, &model, variant.as_deref(), &[], agent.as_deref());
                 match post_prompt(&server, &session_id, dir, &commands, &steer, body).await {
                     Ok(()) => {
                         turn = TurnState::begin(stall);
@@ -1258,7 +1303,7 @@ async fn run_session(session: Session) {
                         } else {
                             // Between turns (shouldn't happen — the engine
                             // steers live runs — but deliver, don't drop).
-                            let body = prompt_body(&steer.prompt, &model, variant.as_deref(), &[]);
+                            let body = prompt_body(&steer.prompt, &model, variant.as_deref(), &[], agent.as_deref());
                             let (prev, next) = rotate(&mut assistant_message_id);
                             let _ = send(&event_tx, AgentEvent::Steered {
                                 assistant_message_id: Some(prev),
@@ -1459,6 +1504,7 @@ fn prompt_body(
     model: &Option<(String, String)>,
     variant: Option<&str>,
     attachments: &[String],
+    agent: Option<&str>,
 ) -> Value {
     let mut parts = vec![json!({ "type": "text", "text": prompt })];
     for path in attachments {
@@ -1479,6 +1525,9 @@ fn prompt_body(
             "model".into(),
             json!({ "providerID": provider, "modelID": model }),
         );
+    }
+    if let Some(agent) = agent {
+        body.insert("agent".into(), Value::String(agent.to_owned()));
     }
     if let Some(variant) = variant {
         body.insert("variant".into(), Value::String(variant.to_owned()));
